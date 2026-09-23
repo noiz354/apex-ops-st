@@ -21,102 +21,91 @@ export function downloadText(filename: string, text: string, type = 'text/csv'):
 
 export type CsvRow = (string | number | null | undefined)[];
 
+export interface CsvOptions {
+  delimiter?: string;
+  quoteAlways?: boolean;
+  mitigateFormulaInjection?: boolean;
+}
+
+type CsvWorkerResponse = { ok: true; csv: string } | { ok: false; error: string };
+
 function needsQuote(s: string, delimiter: string): boolean {
   return s.includes('"') || s.includes('\n') || s.includes('\r') || s.includes(delimiter);
 }
 
-function escapeCell(
-  v: string | number | null | undefined,
-  delimiter: string,
-  mitigateFormula: boolean,
-): string {
+function escapeCell(v: string | number | null | undefined, delim: string, quoteAlways: boolean, mitigateFormula: boolean): string {
   if (v === null || v === undefined) return '';
   if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '';
   let s = String(v);
-  if (mitigateFormula && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  return needsQuote(s, delimiter) ? `"${s.replace(/"/g, '""')}"` : s;
+  // eslint-disable-next-line no-control-regex -- detect leading C0 controls before formula chars
+  if (mitigateFormula && /^[\s\u0000-\u001F]*[=+\-@]/.test(s)) s = `'${s}`;
+  const needQuote = quoteAlways || needsQuote(s, delim);
+  return needQuote ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-function buildCsvSync(
-  rows: CsvRow[],
-  delimiter: string,
-  mitigateFormula: boolean,
-): string {
-  return `\uFEFF${rows.map((r) => r.map((c) => escapeCell(c, delimiter, mitigateFormula)).join(delimiter)).join('\r\n')}`;
+function buildCsvSync(rows: CsvRow[], delimiter: string, quoteAlways: boolean, mitigateFormula: boolean): string {
+  if (!Array.isArray(rows)) throw new TypeError('Invalid CSV input');
+  if (typeof delimiter !== 'string' || delimiter.length !== 1 || /["\r\n]/.test(delimiter)) throw new TypeError('Invalid CSV input');
+  return `\uFEFF${rows.map((r) => {
+    if (!Array.isArray(r)) throw new TypeError('Invalid CSV row');
+    return r.map((c) => escapeCell(c, delimiter, quoteAlways, mitigateFormula)).join(delimiter);
+  }).join('\r\n')}`;
 }
 
-export async function buildCsvViaWorker(
-  rows: CsvRow[],
-  delimiter = ',',
-  opts: { mitigateFormulaInjection?: boolean } = {},
-): Promise<string> {
+export async function buildCsvViaWorker(rows: CsvRow[], delimiter = ',', opts: CsvOptions = {}): Promise<string> {
+  const delim = opts.delimiter ?? delimiter;
+  const quoteAlways = opts.quoteAlways ?? false;
   const mitigateFormula = opts.mitigateFormulaInjection ?? false;
-  if (typeof window === 'undefined' || !('Worker' in window)) {
-    return buildCsvSync(rows, delimiter, mitigateFormula);
-  }
+  if (typeof delim !== 'string' || delim.length !== 1 || /["\r\n]/.test(delim)) throw new TypeError('Invalid CSV input');
+  if (!Array.isArray(rows)) throw new TypeError('Invalid CSV input');
+  if (typeof window === 'undefined' || !('Worker' in window)) return buildCsvSync(rows, delim, quoteAlways, mitigateFormula);
   let worker: Worker;
   try {
     worker = new Worker(new URL('./workers/download.worker.ts', import.meta.url));
   } catch {
-    return buildCsvSync(rows, delimiter, mitigateFormula);
+    return buildCsvSync(rows, delim, quoteAlways, mitigateFormula);
   }
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       worker.terminate();
       reject(new Error('worker-timeout'));
     }, 30_000);
-    worker.onmessage = (ev: MessageEvent<{ csv: string }>) => {
+    worker.onmessage = (ev: MessageEvent<CsvWorkerResponse>) => {
       clearTimeout(timeout);
       worker.terminate();
-      resolve(ev.data.csv);
+      const data = ev.data;
+      if (data.ok) resolve(data.csv);
+      else resolve(buildCsvSync(rows, delim, quoteAlways, mitigateFormula));
     };
     worker.onerror = (e: ErrorEvent) => {
       clearTimeout(timeout);
       worker.terminate();
-      resolve(buildCsvSync(rows, delimiter, mitigateFormula));
+      resolve(buildCsvSync(rows, delim, quoteAlways, mitigateFormula));
       void e;
     };
-    worker.postMessage({ rows, delimiter, mitigateFormulaInjection: mitigateFormula });
+    worker.postMessage({ rows, delimiter: delim, quoteAlways, mitigateFormulaInjection: mitigateFormula });
   });
 }
 
-export async function exportCsvViaWorker(
-  filename: string,
-  rows: CsvRow[],
-  delimiter = ',',
-  opts: { mitigateFormulaInjection?: boolean } = {},
-): Promise<void> {
+export async function exportCsvViaWorker(filename: string, rows: CsvRow[], delimiter = ',', opts: CsvOptions = {}): Promise<void> {
   const csv = await buildCsvViaWorker(rows, delimiter, opts);
   downloadText(filename, csv);
 }
 
 interface SaveFilePickerHandle {
-  createWritable(): Promise<{
-    write(data: Blob | string): Promise<void>;
-    close(): Promise<void>;
-  }>;
+  createWritable(): Promise<{ write(data: Blob | string): Promise<void>; close(): Promise<void> }>;
 }
 
 declare global {
   interface Window {
-    showSaveFilePicker?: (options?: {
-      suggestedName?: string;
-      types?: { description: string; accept: Record<string, string[]> }[];
-    }) => Promise<SaveFilePickerHandle>;
+    showSaveFilePicker?: (options?: { suggestedName?: string; types?: { description: string; accept: Record<string, string[]> }[] }) => Promise<SaveFilePickerHandle>;
   }
 }
 
-export async function saveAsViaPickerOrDownload(
-  filename: string,
-  blob: Blob,
-  mimeType?: string,
-): Promise<'picker' | 'download' | 'cancelled'> {
+export async function saveAsViaPickerOrDownload(filename: string, blob: Blob, mimeType?: string): Promise<'picker' | 'download' | 'cancelled'> {
   if (typeof window !== 'undefined' && 'showSaveFilePicker' in window && window.showSaveFilePicker) {
     try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: sanitizeFilename(filename),
-        types: [{ description: 'Export file', accept: { [mimeType ?? 'text/csv']: ['.csv', '.txt'] } }],
-      });
+      const handle = await window.showSaveFilePicker({ suggestedName: sanitizeFilename(filename), types: [{ description: 'Export file', accept: { [mimeType ?? 'text/csv']: ['.csv', '.txt'] } }] });
       const writable = await handle.createWritable();
       await writable.write(blob);
       await writable.close();
