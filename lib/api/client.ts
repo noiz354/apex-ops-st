@@ -179,7 +179,7 @@ export async function apiFetch<T = unknown>(input: string, opts: ApiFetchOptions
     throw new ApiError(`HTTP_${res.status}`, res.statusText || 'Request failed', res.status, requestId);
   }
 
-  let payload: unknown = null;
+  let payload: unknown;
   try {
     payload = await res.json();
   } catch (err) {
